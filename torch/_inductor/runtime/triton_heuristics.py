@@ -1709,7 +1709,7 @@ class StaticTritonCompileResult(CompileResult[StaticallyLaunchedCudaKernel]):
                 raise CannotStaticallyLaunchKernel(
                     "static launch does not support launch attributes"
                 )
-            
+
             binary_ext = "hsaco" if torch.version.hip else "cubin"
             cubin_location = os.path.join(
                 triton_cache_dir(triton_meta.get("device", 0)),
