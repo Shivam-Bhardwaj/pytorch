@@ -197,6 +197,28 @@ def allow_in_graph(fn):  # type: ignore[no-untyped-def]
     return fn
 
 
+def _check_mutually_exclusive_decorators(fn: Callable, decorator_name: str) -> None:
+    """
+    Check that a function is not already decorated with a mutually exclusive decorator.
+
+    This provides a single place to manage decorator compatibility, making it scalable
+    as we add more decorators.
+    """
+    mutually_exclusive = {
+        "leaf_function": trace_rules.is_leaf_function,
+        "nonstrict_trace": trace_rules.is_nonstrict_trace_callable,
+    }
+
+    for other_name, check_fn in mutually_exclusive.items():
+        if other_name != decorator_name and check_fn(fn):
+            # Sort names alphabetically for consistent error messages
+            first, second = sorted([decorator_name, other_name])
+            raise ValueError(
+                f"Function {fn} cannot be both marked as @{first} and "
+                f"@{second}. Please use only one decorator."
+            )
+
+
 def nonstrict_trace(traceable_fn: Callable[_P, _R]) -> Callable[_P, _R]:
     # Like `allow_in_graph`, but with the following enhancements/differences:
     #
@@ -216,6 +238,8 @@ def nonstrict_trace(traceable_fn: Callable[_P, _R]) -> Callable[_P, _R]:
     # NOTE: like `allow_in_graph`, aliasing information is neither preserved
     # between inputs themselves, nor between inputs and outputs.
     assert callable(traceable_fn), "nonstrict_trace expects a callable"
+
+    _check_mutually_exclusive_decorators(traceable_fn, "nonstrict_trace")
 
     @functools.wraps(traceable_fn)
     def wrapped(*args: _P.args, **kwargs: _P.kwargs) -> _R:
@@ -237,6 +261,240 @@ def nonstrict_trace(traceable_fn: Callable[_P, _R]) -> Callable[_P, _R]:
     weakref.finalize(wrapped, deregister)
 
     return wrapped
+
+
+def leaf_function(fn: Callable[_P, _R]) -> Callable[_P, _R]:
+    """
+    Decorator to mark a function as a leaf function for dynamo.
+
+    A leaf function appears as an opaque operation in the compiled graph. During
+    compilation, dynamo and aot dispatcher do not trace into it. At runtime, the
+    original eager Python code is executed once per call directly.
+
+    How it works:
+        Understanding this mental model helps avoid pitfalls:
+
+        1. **Compilation**: Dynamo and AOT autograd do not trace into the leaf function.
+           Only the fake_impl runs during compilation to determine output signature
+           (pytree structure, tensor shapes, dtypes). The real function runs at runtime
+           as eager Python.
+
+        2. **Autograd**: Inputs and outputs are detached at the leaf function boundary.
+           The leaf function builds its own local autograd graph internally. Gradients
+           flow through this local autograd graph to leaf_function's explicit tensor or
+           nn.Module inputs.
+
+        3. **Isolation**: The leaf function executes as isolated eager Python. Side effects
+           don't cross the boundary between the compiled region and the leaf function
+           as you might expect.
+
+    When to use leaf_function vs allow_in_graph/nonstrict_trace:
+        Use ``leaf_function`` when you need eager execution semantics that tracing
+        cannot preserve, such as:
+
+        - **Logging/debugging**: Print statements should run at runtime, not during tracing
+        - **External library calls**: Code that AOT cannot trace
+        - **Side effects**: Operations that should happen exactly once per call at runtime
+
+        If your function has a static computation graph (no runtime-only side effects),
+        consider using ``allow_in_graph`` or ``nonstrict_trace`` instead - AOT autograd
+        can trace through them and potentially optimize the code.
+
+    Providing fake_impl (required):
+        Since the function body is not traced, a "fake implementation" (fake_impl) is
+        needed to tell the compiler about output shapes and dtypes. Provide it using the
+        ``@<func>.fake_impl`` decorator (e.g., ``@my_leaf_fn.fake_impl``).
+
+        The fake_impl must be traceable and return outputs with the same pytree structure,
+        shapes, and dtypes as the real function. Because it runs at compile time with
+        fake tensors, the output signature must be determinable at compile time. If not,
+        expand the function to include more code until outputs become predictable.
+
+        Note: fake_impl may run multiple times during compilation; real function runs
+        once per call at runtime.
+
+        Output validation against the real function is disabled by default; set
+        ``torch._dynamo.config.leaf_function_validate_outputs = True`` to enable.
+
+    Note:
+        - Training is supported: gradients flow through the leaf function when you
+          call ``.backward()`` on the compiled function's outputs. However, calling
+          ``.backward()`` inside the leaf function itself is not supported.
+
+        - ``nn.Module`` can be passed as an input argument. The module's parameters
+          and buffers will be tracked for autograd, so gradients flow back to them.
+          The module must exist outside the compile region (it cannot be constructed
+          during compilation).
+
+        - Currently works with ``backend="eager"`` and ``backend="aot_eager"`` only.
+          Inductor backend and ``torch.export`` are not yet supported.
+
+    Dangerous patterns (may cause silent incorrectness):
+        Given the mental model above, the following patterns are dangerous:
+
+        - **Side effects between leaf functions and Dynamo regions**: Mutations to
+          Python state (attributes, globals) inside a leaf function may not be visible
+          to the traced region, and vice versa. The compiled graph may reorder or
+          eliminate operations in ways that break assumptions about side effect ordering.
+
+          Bad::
+
+              # Compiled region
+              self.counter += 1
+              y = my_leaf_fn(self, x)  # Don't depend on self.counter inside leaf_fn
+
+              y = my_leaf_fn(self, x)
+              result = self.state  # Don't depend on state mutated by leaf_fn
+
+          Logging/printing inside the leaf function is fine since it doesn't affect
+          correctness.
+
+        - **In-place mutations on inputs**: In-place mutations on input tensors are
+          detected and will raise an error. Clone inputs before mutating them.
+
+          Bad::
+
+              @leaf_function
+              def my_leaf_fn(x):
+                  x.add_(1)  # Will raise: "In-place mutation detected"
+                  return (x,)
+
+        - **Implicit inputs (closures/globals)**: Tensors or modules captured from
+          enclosing scopes in the fake_impl will cause compilation errors. The real
+          function can close over them, but the fake_impl must only use its arguments.
+
+          Bad::
+
+              weight = torch.randn(3, 3)
+
+
+              @leaf_function
+              def my_leaf_fn(x):
+                  return (x @ weight,)
+
+
+              @my_leaf_fn.fake_impl
+              def my_leaf_fn_fake(x):
+                  return (x @ weight,)  # Fails: weight used in fake_impl
+
+          Good::
+
+              weight = torch.randn(3, 3)
+
+
+              @leaf_function
+              def my_leaf_fn(x):
+                  return (x @ weight,)  # OK: real function can use closure
+
+
+              @my_leaf_fn.fake_impl
+              def my_leaf_fn_fake(x):
+                  return (x @ torch.empty_like(x),)  # OK: fake_impl uses only args
+
+    Restrictions:
+        - Inputs must use pytree-compatible types. User-defined classes must be
+          registered via :func:`torch.utils._pytree.register_pytree_node`,
+          :func:`torch.utils._pytree.register_dataclass`, or
+          :func:`torch.utils._pytree.register_constant`. Tensors, Python primitives
+          (int, float, bool, str), and built-in containers (list, tuple, dict) are
+          already handled by default. Primitive values and container structure are
+          specialized per call site: different call sites can use different values,
+          but each call site expects the same primitives and structure on every
+          execution.
+
+        - Outputs must be a tuple of tensors, e.g., ``return (tensor,)`` or
+          ``return (tensor1, tensor2)``. The fake_impl must return a tuple with
+          the same structure.
+
+    Example:
+        # Example 1: External library call
+        # Wrapping code that AOT autograd cannot trace (custom CUDA kernels,
+        # external libraries, etc.)
+        @leaf_function
+        def call_external_kernel(x):
+            # Hypothetical external library that AOT can't trace
+            result = external_lib.custom_kernel(x)
+            return (result,)
+
+        @call_external_kernel.fake_impl
+        def call_external_kernel_fake(x):
+            # Return tensor with same shape/dtype for compile-time inference
+            return (torch.empty_like(x),)
+
+        # Example 2: Logging/debugging
+        # Print statements should execute at runtime, not during tracing
+        @leaf_function
+        def forward_with_logging(model, x):
+            print(f"Input shape: {x.shape}, mean: {x.mean().item():.4f}")
+            out = model(x)
+            print(f"Output range: [{out.min().item():.4f}, {out.max().item():.4f}]")
+            return (out,)
+
+        @forward_with_logging.fake_impl
+        def forward_with_logging_fake(model, x):
+            return (model(x),)
+
+        class DebugModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(10, 10)
+
+            def forward(self, x):
+                return forward_with_logging(self.linear, x)
+
+        # Training - gradients flow through the leaf function
+        model = DebugModule()
+        compiled_model = torch.compile(model, backend="aot_eager")
+        x = torch.randn(32, 10, requires_grad=True)
+        out = compiled_model(x)[0]
+        out.sum().backward()  # Gradients propagate through the leaf function
+
+    Args:
+        fn: The function being decorated.
+    """
+    from . import trace_rules
+
+    _check_mutually_exclusive_decorators(fn, "leaf_function")
+
+    @functools.wraps(fn)
+    def inner(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        return fn(*args, **kwargs)
+
+    # Add leaf function attributes
+    # fake_fn must be set via .fake_impl decorator
+    inner._torchdynamo_leaf_real_fn = fn  # type: ignore[attr-defined]
+    inner._torchdynamo_leaf_fake_fn = None  # type: ignore[attr-defined]
+
+    # Register with trace_rules
+    wrapped_id = id(inner)
+    trace_rules._allowed_callable_ids.add(wrapped_id)
+    trace_rules._leaf_function_ids.add(wrapped_id)
+
+    # Avoid id reuse
+    def deregister() -> None:
+        trace_rules._allowed_callable_ids.remove(wrapped_id)
+        trace_rules._leaf_function_ids.remove(wrapped_id)
+
+    weakref.finalize(inner, deregister)
+
+    # Add fake_impl setter method to the function
+    def fake_impl_setter(fake_fn: Callable[..., Any]) -> Callable[..., Any]:
+        inner._torchdynamo_leaf_fake_fn = fake_fn  # type: ignore[attr-defined]
+        return inner
+
+    inner.fake_impl = fake_impl_setter  # type: ignore[attr-defined]
+
+    return inner
+
+
+def get_leaf_function_fake_impl(fn: Any) -> Any:
+    """Get the fake_impl associated with a leaf_function decorated callable."""
+    return getattr(fn, "_torchdynamo_leaf_fake_fn", None)
+
+
+def get_leaf_function_real_impl(fn: Any) -> Any:
+    """Get the real_impl associated with a leaf_function decorated callable."""
+    return getattr(fn, "_torchdynamo_leaf_real_fn", None)
 
 
 def _disallow_in_graph_helper(throw_if_not_allowed: bool) -> Callable[..., Any]:
