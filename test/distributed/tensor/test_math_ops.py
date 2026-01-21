@@ -35,6 +35,7 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
     skip_unless_torch_gpu,
     with_comms,
 )
+from torch.utils._debug_mode import DebugMode
 
 
 funcol = torch.ops.c10d_functional
@@ -812,6 +813,35 @@ class DistMathOpsTest(DTensorTestBase):
 
         self.assertEqual(sharded_out[0].full_tensor(), expected0)
         self.assertEqual(sharded_out[1].full_tensor(), expected1)
+
+    @with_comms
+    def test_vector_norm_handler_decomposition(self):
+        """Test that p-norms on Shard inputs use the powsum decomposition."""
+        device_mesh = self.build_device_mesh()
+
+        torch.manual_seed(42)
+        grad = torch.randn(12, 8)
+        sharded_grad = distribute_tensor(grad, device_mesh, [Shard(0)])
+
+        with DebugMode() as debug_mode:
+            result = torch.linalg.vector_norm(sharded_grad, 2)
+
+        # Verify decomposition: powsum -> redistribute -> pow
+        self.assertExpectedInline(
+            debug_mode.debug_string(),
+            """\
+  torch.linalg.vector_norm(dt$0: f32[12, 8]| S(0), 2)  ->  dt$4: f32[]| R
+    aten::linalg_vector_norm.default(dt$0: f32[12, 8]| S(0), 2)
+      aten::linalg__powsum(t$1: f32[3, 8], 2, None, False, None)  ->  t$2: f32[]
+      _c10d_functional::all_reduce(t$2: f32[], 'sum', '0')  ->  t$3: f32[]
+      _c10d_functional::wait_tensor(t$3: f32[])  ->  t$3: f32[]
+      aten::pow.Tensor_Scalar(t$3: f32[], 0.5)  ->  t$4: f32[]""",
+        )
+
+        # Expected: sqrt(sum(|x|^2))
+        expected = (grad.abs() ** 2).sum() ** 0.5
+        self.assertEqual(result.full_tensor(), expected)
+        self.assertTrue(result.placements[0].is_replicate())
 
     @with_comms
     def test_foreach_norm_different_mesh(self):
