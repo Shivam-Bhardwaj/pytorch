@@ -2,6 +2,7 @@
 import copy
 import logging
 import traceback
+import warnings
 from contextlib import contextmanager
 from enum import Enum
 from typing import Any, Optional, Union
@@ -19,6 +20,8 @@ log = logging.getLogger(__name__)
 __all__ = [
     "annotate",
     "annotate_fn",
+    "annotate_scope",
+    "annotate_scope_fn",
     "preserve_node_meta",
     "has_preserved_node_meta",
     "set_stack_trace",
@@ -37,6 +40,21 @@ __all__ = [
 current_meta: dict[str, Any] = {}
 current_replay_node: Optional[Node] = None
 should_preserve_node_meta = False
+
+
+# If you change the key here, you should also change
+# _COPY_META_FIELDS in torch/fx/proxy.py
+SCOPE_ANNOTATION_KEY = "annotated_scope"
+COMPILE_SCOPE_ANNOTATION_KEY = "_pt2_compiled_region"
+SCOPE_DELIMITER = "."
+
+# List of metadata keys used for annotations
+# These keys are propagated through various compilation passes
+ANNOTATION_META_KEYS = ["custom", SCOPE_ANNOTATION_KEY]
+# List of reserved keys for node.meta["custom"]
+CUSTOM_ANNOTATION_META_KEYS = [COMPILE_SCOPE_ANNOTATION_KEY]
+
+# TODO (shangdiy): we should error out if user tries to use reserved keys
 
 GRADIENT_ACC_SPECIAL_STACK = (
     "Gradient addition node due to multiple use of tensor around:"
@@ -285,6 +303,10 @@ def annotate(annotation_dict: dict):
     This is intended for advanced users who need to attach additional metadata to the fx nodes
     (e.g., for debugging, analysis, or external tooling) during export tracing.
 
+    When nested, annotations with the same keys are overridden by the innermost context,
+    while annotations with different keys are merged. Upon exiting each nested context,
+    the annotations are restored to their previous state.
+
     Note:
         This API is **not backward compatible** and may evolve in future releases.
 
@@ -324,6 +346,56 @@ def annotate(annotation_dict: dict):
 
 
 @compatibility(is_backward_compatible=False)
+@contextmanager
+def annotate_scope(scope: str):
+    """
+    Temporarily adds a scope annotation to the current tracing context.
+    FX nodes will have the annotation in node.metadata["annotated_scope"].
+
+    When nested, scope annotations are automatically concatenated with dots ('.') to create
+    a hierarchical path (e.g., "model.encoder.layer1").
+
+    Note:
+        This API is **not backward compatible** and may evolve in future releases.
+
+    Note:
+        This API is not compatible with fx.symbolic_trace or jit.trace. It's intended
+        to be used with PT2 family of tracers, e.g. torch.export and dynamo.
+
+    Args:
+        scope (str): Scope name to inject into FX trace metadata. Avoid using dots ('.').
+
+    Example:
+        >>> with annotate_scope("model"):
+        ...     with annotate_scope("encoder"):
+        ...         x = y + z  # annotated_scope="model.encoder"
+    """
+    if SCOPE_DELIMITER in scope:
+        warnings.warn(
+            f"annotate_scope {scope} contains '{SCOPE_DELIMITER}'. "
+            f"'{SCOPE_DELIMITER}' is used as the delimiter. "
+            f"Consider using a different scope annotation."
+        )
+    global current_meta
+
+    has_scope_annotation = SCOPE_ANNOTATION_KEY in current_meta
+    old_scope = current_meta.get(SCOPE_ANNOTATION_KEY, "")
+
+    try:
+        if not has_scope_annotation:
+            current_meta[SCOPE_ANNOTATION_KEY] = scope
+        else:
+            current_meta[SCOPE_ANNOTATION_KEY] = old_scope + SCOPE_DELIMITER + scope
+        yield
+    finally:
+        if has_scope_annotation:
+            # Restore the original custom dict
+            current_meta[SCOPE_ANNOTATION_KEY] = old_scope
+        else:
+            del current_meta[SCOPE_ANNOTATION_KEY]
+
+
+@compatibility(is_backward_compatible=False)
 def annotate_fn(annotation_dict: dict):
     """
     A decorator that wraps a function with the annotate context manager.
@@ -353,6 +425,44 @@ def annotate_fn(annotation_dict: dict):
         @wraps(func)
         def wrapper(*args, **kwargs):
             with annotate(annotation_dict):
+                return func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
+@compatibility(is_backward_compatible=False)
+def annotate_scope_fn(scope: str):
+    """
+    A decorator that wraps a function with the annotate_scope context manager.
+    Use this when you want to annotate an entire function with a scope
+    instead of a specific code block.
+
+    Note:
+        This API is **not backward compatible** and may evolve in future releases.
+
+    Note:
+        This API is not compatible with fx.symbolic_trace or jit.trace. It's intended
+        to be used with PT2 family of tracers, e.g. torch.export and dynamo.
+
+    Args:
+        scope (str): A scope string to inject into the FX trace metadata
+            for all operations in the function.
+
+    Example:
+        All operations in my_function will have annotated_scope metadata.
+
+        >>> @annotate_scope_fn("my_module.my_function")
+        ... def my_function(x):
+        ...     return x + 1
+    """
+    from functools import wraps
+
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            with annotate_scope(scope):
                 return func(*args, **kwargs)
 
         return wrapper
@@ -431,6 +541,11 @@ def get_current_meta() -> dict[str, Any]:
 
 
 @compatibility(is_backward_compatible=False)
+def get_current_scope() -> str:
+    return current_meta.get(SCOPE_ANNOTATION_KEY, "")
+
+
+@compatibility(is_backward_compatible=False)
 @contextmanager
 def set_current_replay_node(node):
     """
@@ -485,18 +600,76 @@ def get_graph_provenance_json(graph: Graph) -> dict[str, Any]:
         return {}
 
 
-def _get_custom_metadata(gm: GraphModule) -> str:
+def _get_annotation_metadata(gm: GraphModule, key: str) -> str:
+    """
+    Generic helper to extract annotation metadata for a given key from a GraphModule.
+
+    Args:
+        gm: The GraphModule to extract metadata from
+        key: The metadata key to extract (e.g., "custom", "annotated_scope")
+
+    Returns:
+        A string representation of all nodes with the specified metadata key
+    """
     assert isinstance(gm, GraphModule)
 
     def helper(gm: GraphModule):
-        custom_metadata = []
+        metadata = []
         for node in gm.graph.nodes:
-            if hasattr(node, "meta") and node.meta.get("custom", None):
-                custom_metadata.append((node.op, node.name, node.meta["custom"]))
+            if hasattr(node, "meta") and node.meta.get(key, None):
+                metadata.append((node.op, node.name, node.meta[key]))
             if node.op == "get_attr" and isinstance(
                 getattr(gm, node.target), GraphModule
             ):
-                custom_metadata.append(helper(getattr(gm, node.target)))
-        return custom_metadata
+                metadata.append(helper(getattr(gm, node.target)))
+        return metadata
 
     return "\n".join(str(x) for x in helper(gm))
+
+
+def _get_custom_metadata(gm: GraphModule) -> str:
+    """
+    Extract custom annotation metadata from a GraphModule.
+    This function maintains backward compatibility.
+
+    Args:
+        gm: The GraphModule to extract metadata from
+
+    Returns:
+        A string representation of all nodes with custom metadata
+    """
+    return _get_annotation_metadata(gm, "custom")
+
+
+def _get_annotated_scope_metadata(gm: GraphModule) -> str:
+    """
+    Extract annotated_scope metadata from a GraphModule.
+
+    Args:
+        gm: The GraphModule to extract metadata from
+
+    Returns:
+        A string representation of all nodes with annotated_scope metadata
+    """
+    return _get_annotation_metadata(gm, "annotated_scope")
+
+
+def remove_scope_metadata_prefix(subgraph: GraphModule, prefix: str):
+    """
+    Remove `prefix` from the prefix of node's scope metadata
+    """
+    if prefix:
+        prefix += SCOPE_DELIMITER
+        for node in subgraph.graph.nodes:
+            if SCOPE_ANNOTATION_KEY in node.meta:
+                scope = node.meta[SCOPE_ANNOTATION_KEY]
+                new_scope = scope.removeprefix(prefix)
+                node.meta[SCOPE_ANNOTATION_KEY] = new_scope
+
+
+def _get_compile_scope_annotation():
+    """
+    Get the current scope annotation for the current compilation.
+    """
+    global current_meta, COMPILE_SCOPE_ANNOTATION_KEY
+    return current_meta.get("custom", {}).get(COMPILE_SCOPE_ANNOTATION_KEY, "")

@@ -640,9 +640,21 @@ class CodeGen:
 
             if node.op not in {"placeholder", "output"}:
                 annotation_str = ""
-                annotation = node.meta.get("custom", {})
-                if annotation:
-                    annotation_str = f" Annotation: {annotation}"
+                # Collect all annotation metadata
+                annotation_parts = []
+
+                # Handle custom annotation with label
+                custom = node.meta.get("custom", {})
+                if custom:
+                    annotation_parts.append(f"Annotation: {custom}")
+
+                # Handle annotated_scope with label
+                annotated_scope = node.meta.get("annotated_scope", None)
+                if annotated_scope:
+                    annotation_parts.append(f"Scope: '{annotated_scope}'")
+
+                if annotation_parts:
+                    annotation_str = " " + ", ".join(annotation_parts)
 
                 stack_trace_str = "No stacktrace found for following nodes"
                 if stack_trace := node.stack_trace:

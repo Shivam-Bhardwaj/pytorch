@@ -13,6 +13,7 @@ from torch._C import (
 )
 from torch._dynamo.testing import normalize_gm
 from torch._dynamo.utils import counters
+from torch.fx.experimental.proxy_tensor import make_fx
 from torch.overrides import (
     _get_current_function_mode_stack,
     BaseTorchFunctionMode,
@@ -808,7 +809,6 @@ class InvokeSubgraphBackendTests(torch._dynamo.test_case.TestCase):
         When force_compile_during_fx_trace=True, the invoke_subgraph backend should
         emit an invoke_subgraph HOP in the traced graph instead of inlining the subgraph.
         """
-        from torch.fx.experimental.proxy_tensor import make_fx
 
         torch._dynamo.reset()  # Clear any cached graphs
 
@@ -858,7 +858,6 @@ class outer_fn(torch.nn.Module):
         don't cause guard failures, both calls should reference the same subgraph.
         """
         from torch._guards import tracing, TracingContext
-        from torch.fx.experimental.proxy_tensor import make_fx
 
         torch._dynamo.reset()
 
@@ -912,7 +911,6 @@ class outer_fn(torch.nn.Module):
         failures (e.g., different bool values), each compilation should result
         in a separate invoke_subgraph with a different identifier.
         """
-        from torch.fx.experimental.proxy_tensor import make_fx
 
         torch._dynamo.reset()
 
@@ -969,7 +967,6 @@ class outer_fn(torch.nn.Module):
         Verifies that the invoke_subgraph HOP correctly handles functions
         that take more than 2 tensor inputs.
         """
-        from torch.fx.experimental.proxy_tensor import make_fx
 
         torch._dynamo.reset()
 
@@ -1016,7 +1013,6 @@ class outer_fn(torch.nn.Module):
         Verifies that the invoke_subgraph HOP correctly handles functions
         that return multiple tensors.
         """
-        from torch.fx.experimental.proxy_tensor import make_fx
 
         torch._dynamo.reset()
 
@@ -1066,7 +1062,6 @@ class outer_fn(torch.nn.Module):
         Verifies that the invoke_subgraph HOP correctly handles functions
         that have both multiple tensor inputs and multiple tensor outputs.
         """
-        from torch.fx.experimental.proxy_tensor import make_fx
 
         torch._dynamo.reset()
 
@@ -1108,6 +1103,61 @@ class outer_fn(torch.nn.Module):
             mul_1: "f32[3, 3]" = torch.ops.aten.mul.Tensor(mul, arg2_1);  mul = arg2_1 = None
             return (add_1, mul_1)
 """,  # noqa: B950
+        )
+
+    @torch._dynamo.config.patch(force_compile_during_fx_trace=True)
+    def test_annotate_module(self):
+        """Test annotate_scope with nested function calls.
+
+        Demonstrates that when inner_fn is called multiple times within
+        outer_fn's scope, each call's operations get the correct nested
+        scope annotation.
+        """
+        import torch.fx.traceback as fx_traceback
+        from torch._guards import tracing, TracingContext
+
+        torch._dynamo.reset()
+
+        def simple_fn(x):
+            with fx_traceback.annotate_scope("inner"):
+                return x * 2
+
+        compiled_fn = torch.compile(simple_fn, backend="invoke_subgraph")
+
+        def outer_fn(x, y):
+            # Call the same compiled function twice
+            with fx_traceback.annotate_scope("outer_1"):
+                a = compiled_fn(x)
+            with fx_traceback.annotate_scope("outer_2"):
+                b = compiled_fn(y)
+            return a + b
+
+        x = torch.randn(3, 3)
+        y = torch.randn(3, 3)
+
+        # Set up TracingContext so invoke_subgraph cache works
+        tracing_ctx = TracingContext(fake_mode=None)
+        with tracing(tracing_ctx), fx_traceback.preserve_node_meta():
+            traced = make_fx(
+                outer_fn, tracing_mode="fake", _disable_torch_fn_metadata_mode=True
+            )(x, y)
+
+        # Only 1 subgraph is produced
+        self.assertEqual(len(list(traced.modules())), 2)
+
+        custom_metadata = fx_traceback._get_annotated_scope_metadata(traced)
+        # The torch.ops.higher_order.invoke_subgraph and get_attr nodes have correct outer anntoation
+        self.assertExpectedInline(
+            str(custom_metadata),
+            """\
+('get_attr', 'repeated_subgraph0', 'outer_1')
+[('call_function', 'mul', 'inner')]
+('call_function', 'invoke_subgraph', 'outer_1')
+('call_function', 'getitem', 'outer_1')
+('get_attr', 'repeated_subgraph0_1', 'outer_2')
+[('call_function', 'mul', 'inner')]
+('call_function', 'invoke_subgraph_1', 'outer_2')
+('call_function', 'getitem_1', 'outer_2')""",
         )
 
 

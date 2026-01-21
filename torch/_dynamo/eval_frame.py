@@ -989,7 +989,11 @@ class _TorchDynamoContext:
                 _maybe_set_eval_frame(_callback_from_stance(callback))
 
                 try:
-                    return fn(*args, **kwargs)
+                    current_scope = torch.fx.traceback.get_current_scope()
+                    with torch.fx.traceback.annotate(
+                        {torch.fx.traceback.COMPILE_SCOPE_ANNOTATION_KEY: current_scope}
+                    ):
+                        return fn(*args, **kwargs)
                 except (Unsupported, UncapturedHigherOrderOpError) as e:
                     if config.verbose:
                         raise
