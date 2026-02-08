@@ -4693,6 +4693,19 @@ class TestLinalg(TestCase):
 
                 self.assertEqual(*torch.broadcast_tensors(B, B_other))
 
+    @dtypes(*floating_and_complex_types())
+    def test_linalg_solve_triangular_errors(self, device, dtype):
+        # Tests error cases for solve_triangular
+
+        # device mismatch: A and B on different devices
+        if torch.cuda.is_available():
+            A = torch.randn(3, 3, dtype=dtype, device=device)
+            A.triu_()
+            wrong_device = 'cpu' if self.device_type != 'cpu' else 'cuda'
+            B = torch.randn(3, 2, dtype=dtype, device=wrong_device)
+            with self.assertRaisesRegex(RuntimeError, 'Expected A and B to be on the same device'):
+                torch.linalg.solve_triangular(A, B, upper=True)
+
     def triangular_solve_test_helper(self, A_dims, b_dims, upper, unitriangular,
                                      device, dtype):
         triangle_function = torch.triu if upper else torch.tril

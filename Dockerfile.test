@@ -1,0 +1,48 @@
+FROM python:3.11-bookworm
+
+# Install system dependencies for PyTorch CPU build
+RUN apt-get update && apt-get install -y \
+    git \
+    ninja-build \
+    gcc \
+    g++ \
+    libopenblas-dev \
+    libblas-dev \
+    liblapack-dev \
+    wget \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install newer CMake (>= 3.27 required)
+RUN pip install --upgrade pip && pip install cmake ninja
+
+# Set up working directory
+WORKDIR /workspace
+
+# Clone PyTorch with submodules
+RUN git clone --recursive --depth 1 https://github.com/pytorch/pytorch.git
+
+WORKDIR /workspace/pytorch
+
+# Copy just the changed files on top
+COPY aten/src/ATen/native/LinearAlgebraUtils.h /workspace/pytorch/aten/src/ATen/native/LinearAlgebraUtils.h
+COPY test/test_linalg.py /workspace/pytorch/test/test_linalg.py
+
+# Install Python dependencies
+RUN pip install numpy pyyaml typing_extensions expecttest hypothesis pytest
+
+# Build PyTorch CPU-only with minimal features for faster build
+ENV USE_CUDA=0 \
+    USE_DISTRIBUTED=0 \
+    USE_MKLDNN=0 \
+    USE_FBGEMM=0 \
+    USE_NNPACK=0 \
+    USE_QNNPACK=0 \
+    USE_XNNPACK=0 \
+    BUILD_TEST=0 \
+    USE_FLASH_ATTENTION=0 \
+    USE_MEM_EFF_ATTENTION=0
+
+# Install PyTorch in editable mode
+RUN pip install --no-build-isolation -v -e .
+
+CMD ["bash"]

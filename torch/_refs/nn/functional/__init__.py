@@ -1231,9 +1231,17 @@ def pdist(a: TensorLikeType, p: float = 2) -> TensorLikeType:
 @register_decomposition(aten.pixel_shuffle)
 @out_wrapper()
 def pixel_shuffle(self: Tensor, upscale_factor: int):
+    import sys
+
     torch._check(
         self.dim() >= 3,
         lambda: f"pixel_shuffle expects input to have at least 3 dimensions, but got input with {self.dim} dimension(s)",
+    )
+    # Check for overflow: upscale_factor^2 must not overflow int64
+    torch._check(
+        upscale_factor <= 0 or upscale_factor <= sys.maxsize // upscale_factor,
+        lambda: f"upscale_factor is too large, (upscale_factor)^2 would overflow: "
+        f"upscale_factor={upscale_factor}",
     )
     batch = self.shape[:-3]
     C_out = self.shape[-3] // upscale_factor**2
@@ -1259,9 +1267,18 @@ def pixel_shuffle(self: Tensor, upscale_factor: int):
 @register_decomposition(aten.pixel_unshuffle)
 @out_wrapper()
 def pixel_unshuffle(self: Tensor, downscale_factor: int):
+    import sys
+
     torch._check(
         self.dim() >= 3,
         lambda: f"pixel_unshuffle expects input to have at least 3 dimensions, but got input with {self.dim} dimension(s)",
+    )
+    # Check for overflow: downscale_factor^2 must not overflow int64
+    torch._check(
+        downscale_factor <= 0
+        or downscale_factor <= sys.maxsize // downscale_factor,
+        lambda: f"downscale_factor is too large, (downscale_factor)^2 would overflow: "
+        f"downscale_factor={downscale_factor}",
     )
     batch = self.shape[:-3]
     C_out = self.shape[-3] * downscale_factor**2

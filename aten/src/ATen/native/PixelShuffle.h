@@ -1,5 +1,6 @@
 #include <ATen/core/Tensor.h>
 #include <c10/util/Exception.h>
+#include <c10/util/safe_numerics.h>
 
 namespace at::native {
 
@@ -11,9 +12,12 @@ inline void check_pixel_shuffle_shapes(const Tensor& self, int64_t upscale_facto
               "pixel_shuffle expects a positive upscale_factor, but got ",
               upscale_factor);
   int64_t c = self.size(-3);
-  TORCH_CHECK_VALUE(upscale_factor <= std::numeric_limits<decltype(upscale_factor)>::max() / upscale_factor,
-        "upscale factor is too large, (upscale_factor)^2 overflowed: upscale_factor=", upscale_factor);
-  int64_t upscale_factor_squared = upscale_factor * upscale_factor;
+  int64_t upscale_factor_squared;
+  TORCH_CHECK(
+      !c10::mul_overflows(upscale_factor, upscale_factor, &upscale_factor_squared),
+      "pixel_shuffle: upscale_factor is too large, (upscale_factor)^2 would overflow: "
+      "upscale_factor=",
+      upscale_factor);
   TORCH_CHECK(c % upscale_factor_squared == 0,
               "pixel_shuffle expects its input's 'channel' dimension to be divisible by the square of "
               "upscale_factor, but input.size(-3)=", c, " is not divisible by ", upscale_factor_squared);
@@ -28,6 +32,12 @@ inline void check_pixel_unshuffle_shapes(const Tensor& self, int64_t downscale_f
   TORCH_CHECK(
       downscale_factor > 0,
       "pixel_unshuffle expects a positive downscale_factor, but got ",
+      downscale_factor);
+  int64_t downscale_factor_squared;
+  TORCH_CHECK(
+      !c10::mul_overflows(downscale_factor, downscale_factor, &downscale_factor_squared),
+      "pixel_unshuffle: downscale_factor is too large, (downscale_factor)^2 would overflow: "
+      "downscale_factor=",
       downscale_factor);
   int64_t h = self.size(-2);
   int64_t w = self.size(-1);
